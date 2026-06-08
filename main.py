@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import os 
 
 # Configuração da página para aproveitar o espaço lateral
 st.set_page_config(page_title="Dashboard Auditoria APAC", layout="wide")
@@ -15,15 +16,23 @@ def carregar_dados(file):
     df_apac = pd.read_excel(file, sheet_name="Relação_APAC", header=12)
     df_erros = pd.read_excel(file, sheet_name="Erros Encontrados", header=12)
     df_sintese = pd.read_excel(file, sheet_name="Memória_Síntese", header=12)
-    return df_apac, df_erros, df_sintese
-
+    df_resumo = pd.read_excel(file, sheet_name="Resumo de Valores", header=12)
+    df_sigtap = pd.read_csv("SIGTAP.csv", sep=",")
+        
+    return df_apac, df_erros, df_sintese, df_resumo, df_sigtap
 
 arquivo_upload = st.file_uploader("Suba a planilha raw.xlsx", type=["xlsx"])
 
 if arquivo_upload:
     with st.status("Processando dados...", expanded=False) as status:
-        apac_raw, erros_raw, sintese_raw = carregar_dados(arquivo_upload)
-
+        try:
+            apac_raw, erros_raw, sintese_raw, resumo_raw, sigtap_raw = carregar_dados(arquivo_upload)
+            status.update(label="✅ Processamento concluído!", state="complete")
+        except FileNotFoundError:
+            status.update(label="❌ Erro na base", state="error")
+            st.error("⚠️ O arquivo base **SIGTAP.csv** não foi encontrado na pasta raiz do sistema. Comunique o administrador.")
+            st.stop() 
+            
         # --- TRATAMENTO E FILTROS ---
         subst = {
             "SEM ERRO RELACIONADO A TETO FINANCEIRO (VERIFICAR PLANILHAS ERROS ENCONTRADOS E SEM ORÇAMENTO)": "SEM ERRO RELACIONADO A TETO FINANCEIRO",
@@ -140,6 +149,102 @@ if arquivo_upload:
         st.write("**Procedimento por Valor de Glosa**")
         st.dataframe(rank_proc_sintese.style.format(
             {'Valor Glosa': 'R$ {:,.2f}'}), width='stretch')
+    
+    # --- BLOCO 4: PRODUZIDO VS APROVADO (POR UNIDADE E GRUPO) ---
+    st.divider()
+    st.subheader("⚖️ Visão de Execução: Produzido vs. Aprovado (Por Grupo)")
+    
+    try:
+        # Nomes das colunas (ajuste se os nomes no SIGTAP.csv forem diferentes)
+        chave_resumo = 'Código' 
+        chave_sigtap = 'Código' 
+        coluna_grupo = 'Grupo'  
+        
+        # 1. Tratamento agressivo das chaves para garantir o cruzamento perfeito
+        # Converte para texto -> Remove ".0" do final -> Remove espaços -> Coloca zeros à esquerda
+        resumo_raw[chave_resumo] = (resumo_raw[chave_resumo]
+                                    .astype(str)
+                                    .str.replace(r'\.0$', '', regex=True)
+                                    .str.strip()
+                                    .str.zfill(10))
+        
+        sigtap_raw[chave_sigtap] = (sigtap_raw[chave_sigtap]
+                                    .astype(str)
+                                    .str.replace(r'\.0$', '', regex=True)
+                                    .str.strip()
+                                    .str.zfill(10))
+        
+        # 2. Cruzamento (Merge/PROCV)
+        df_resumo_grupo = pd.merge(
+            resumo_raw, 
+            sigtap_raw[[chave_sigtap, coluna_grupo]], 
+            left_on=chave_resumo, 
+            right_on=chave_sigtap, 
+            how='left'
+        )
+        
+        # Preencher vazios caso algum código não exista no SIGTAP
+        df_resumo_grupo[coluna_grupo] = df_resumo_grupo[coluna_grupo].fillna('Sem Grupo Vinculado')
 
-else:
-    st.info("Aguardando upload do arquivo Excel.")
+        # 3. Agrupamento retirando Procedimento e usando apenas Unidade e Grupo
+        df_execucao = df_resumo_grupo.groupby(['Unidade', coluna_grupo], as_index=False).agg(
+            Qtd_Produzida=('Qtd. Produzida', 'sum'),
+            Qtd_Aprovada=('Qtd. Aprovada', 'sum'),
+            Valor_Produzido=('Valor Produzido', 'sum'),
+            Valor_Aprovado=('Valor Aprovado', 'sum'),
+            Valor_Glosa=('Valor Glosa', 'sum')
+        )
+        
+        # 4. Cálculo dos percentuais
+        df_execucao['% Aprovação Físico'] = df_execucao.apply(
+            lambda x: (x['Qtd_Aprovada'] / x['Qtd_Produzida'] * 100) if x['Qtd_Produzida'] > 0 else 0, axis=1
+        )
+        
+        df_execucao['% Aprovação Financeiro'] = df_execucao.apply(
+            lambda x: (x['Valor_Aprovado'] / x['Valor_Produzido'] * 100) if x['Valor_Produzido'] > 0 else 0, axis=1
+        )
+
+        # Ordenação por Valor Glosa (do maior para o menor)
+        df_execucao = df_execucao.sort_values(by=['Unidade', 'Valor_Glosa'], ascending=[True, False])
+
+        col7, col8 = st.columns([3, 1])
+        
+        with col7:
+            # Exibição mantendo as cores no percentual
+            st.dataframe(
+                df_execucao.style.format({
+                    'Qtd_Produzida': '{:,.0f}',
+                    'Qtd_Aprovada': '{:,.0f}',
+                    'Valor_Produzido': 'R$ {:,.2f}',
+                    'Valor_Aprovado': 'R$ {:,.2f}',
+                    'Valor_Glosa': 'R$ {:,.2f}',
+                    '% Aprovação Físico': '{:.1f}%',
+                    '% Aprovação Financeiro': '{:.1f}%'
+                }).background_gradient(subset=['% Aprovação Físico'], cmap='RdYlGn', vmin=0, vmax=100),
+                width='stretch'
+            )
+            
+        with col8:
+            total_qtd_prod = df_execucao['Qtd_Produzida'].sum()
+            total_qtd_aprov = df_execucao['Qtd_Aprovada'].sum()
+            total_vlr_prod = df_execucao['Valor_Produzido'].sum()
+            total_vlr_aprov = df_execucao['Valor_Aprovado'].sum()
+            
+            taxa_aprov_geral = (total_qtd_aprov / total_qtd_prod * 100) if total_qtd_prod > 0 else 0
+            
+            st.metric("Total Qtd Produzida", f"{total_qtd_prod:,.0f}")
+            st.metric("Total Qtd Aprovada", f"{total_qtd_aprov:,.0f}")
+            st.metric("Taxa Aprovação (Física)", f"{taxa_aprov_geral:.1f}%")
+            
+            if total_vlr_prod > 0:
+                st.metric("Valor Total Produzido", f"R$ {total_vlr_prod:,.2f}")
+                st.metric("Valor Total Aprovado", f"R$ {total_vlr_aprov:,.2f}")
+
+    except KeyError as e:
+        st.error(f"⚠️ Erro nas colunas: {e}. Verifique se os nomes das colunas na aba 'Resumo de Valores' e na tabela 'SIGTAP' estão corretos no código.")
+        st.error(f"Colunas esperadas para cruzamento: '{chave_resumo}' na aba 'Resumo de Valores' e '{chave_sigtap}' na tabela 'SIGTAP'. Coluna de grupo esperada: '{coluna_grupo}'.")
+        st.error(f"df_resumo_grupo colunas: {sigtap_raw.columns.tolist()}")
+        st.error(f"df_resumo_grupo colunas: {resumo_raw.columns.tolist()}")
+        st.error(f"df_resumo_grupo colunas: {df_resumo_grupo.columns.tolist()}")
+    else:
+        st.info("Aguardando upload do arquivo Excel.")
